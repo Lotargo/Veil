@@ -11,6 +11,7 @@ while it ran) is adopted instead of starting a second one.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,8 @@ UNCONFIRMED_CHECK_SECONDS = 60.0
 # Failures where Colab certainly started nothing.
 REFUSED_CODES = {"gpu_rejected", "allocation_refused"}
 ACTIVE_STATES = {"waiting", "sent", "received", "preparing", "queued", "running", "collecting"}
+DRIVE_AUTH_TIMEOUT_SECONDS = 300
+
 LIVE_STATES = {"allocating", "booting", "ready"}
 
 
@@ -237,6 +240,9 @@ class ColabRuntime:
         self.name: str | None = None
         self.gpu: str | None = None
         self.gpu_name: str | None = None
+        self.drive_auth_url: str | None = None
+        self.drive_cache_state = "off"
+        self._drive_process: subprocess.Popen[bytes] | None = None
         self.boot_stage: str | None = None
         self.error: dict[str, Any] | None = None
         self.started_at: float | None = None
@@ -273,6 +279,8 @@ class ColabRuntime:
                 "name": self.name,
                 "gpu": self.gpu,
                 "gpu_name": self.gpu_name,
+                "model_cache": {"enabled": self.store.remote_settings()["colab"]["model_cache"],
+                                "state": self.drive_cache_state, "auth_url": self.drive_auth_url},
                 "boot_stage": self.boot_stage,
                 "error": self.error,
                 "started_at": self.started_at,
@@ -320,6 +328,8 @@ class ColabRuntime:
         """End this manager's threads (tests); a running runtime is left to its idle stop."""
         self._closed.set()
         self._wake.set()
+        if self._drive_process is not None and self._drive_process.poll() is None:
+            self._drive_process.terminate()
         if self._stream_process is not None and self._stream_process.poll() is None:
             self._stream_process.kill()
 
@@ -360,6 +370,7 @@ class ColabRuntime:
                 "job_state": job.state,
                 "runtime_state": self.state,
                 "boot_stage": self.boot_stage,
+                "model_cache": {"state": self.drive_cache_state},
                 "gpu": self.gpu,
                 "downloads": downloads,
                 "error": job.error if job.state == "failed" else None,
@@ -401,6 +412,78 @@ class ColabRuntime:
                 logger.exception("Colab runtime control loop failed")
 
     # --- which runtimes are ours ------------------------------------------------------
+
+    def continue_drive_auth(self) -> None:
+        """Resume only the mount process that is waiting for the user's Google approval."""
+        with self._lock:
+            process = self._drive_process
+            if not self.drive_auth_url or process is None or process.poll() is not None or process.stdin is None:
+                raise ColabCLIError("no drive authorization is waiting", code="drive_not_waiting")
+            try:
+                process.stdin.write(b"\n")
+                process.stdin.flush()
+            except OSError as exc:
+                raise ColabCLIError("cannot resume google drive authorization", code="drive_mount_failed") from exc
+            self.drive_auth_url = None
+            self.drive_cache_state = "mounting"
+
+    def _mount_drive(self, name: str) -> None:
+        self.drive_cache_state = "mounting"
+        process = self.cli.start_drive_mount(name)
+        self._drive_process = process
+
+        def read(stream: Any) -> None:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode("utf-8", errors="replace").strip()
+                if "Drive Authorization needed" in line:
+                    self.drive_cache_state = "authorizing"
+                if self.drive_cache_state == "authorizing" and line.startswith("https://"):
+                    parsed = urllib.parse.urlparse(line)
+                    if parsed.hostname in {"accounts.google.com", "colab.research.google.com"}:
+                        with self._lock:
+                            self.drive_auth_url = line
+
+        readers = [threading.Thread(target=read, args=(stream,), daemon=True, name="mediastudio-drive-mount")
+                   for stream in (process.stdout, process.stderr) if stream is not None]
+        for reader in readers:
+            reader.start()
+        deadline = time.monotonic() + DRIVE_AUTH_TIMEOUT_SECONDS
+        try:
+            while process.poll() is None:
+                if self._closed.wait(0.1) or self.state != "booting":
+                    raise ColabCLIError("google drive connection was cancelled", code="drive_mount_failed")
+                if time.monotonic() >= deadline:
+                    raise ColabCLIError(
+                        "google drive access was not confirmed within 5 minutes, open the Google access link and try again",
+                        code="drive_auth_timeout",
+                    )
+            for reader in readers:
+                reader.join(timeout=2)
+            if process.returncode != 0:
+                raise ColabCLIError("google drive could not connect, grant access in Remote GPU and try again",
+                                    code="drive_mount_failed")
+            # Some CLI releases print a kernel exception but still return zero.
+            checked = self.cli.exec_code(name,
+                "from pathlib import Path\nassert Path('/content/drive/MyDrive').is_dir(), 'drive mount missing'",
+                timeout=30, attempts=1)
+            if checked.returncode != 0:
+                raise ColabCLIError("google drive mount is unavailable", code="drive_mount_failed")
+            self.drive_cache_state = "ready"
+        finally:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            for reader in readers:
+                reader.join(timeout=2)
+            for stream in (process.stdin, process.stdout, process.stderr):
+                if stream is not None:
+                    stream.close()
+            self._drive_process = None
+            self.drive_auth_url = None
 
     @property
     def _records(self) -> Path:
@@ -516,15 +599,23 @@ class ColabRuntime:
             self.name, self._last_seq, self.vm_files = name, 0, set()
         self._record_owner(name)
         try:
+            if settings["model_cache"]:
+                with self._lock:
+                    self.state, self.boot_stage = "booting", "drive"
+                self._mount_drive(name)
+                self.boot_stage = "comfyui"
             defined = self.cli.exec_code(name, WORKER_SOURCE.read_text(encoding="utf-8"), timeout=180)
             if defined.returncode != 0:
                 raise ColabCLIError(f"The worker could not start: {defined.stderr.strip()[-300:]}", code="worker_failed")
             spec = {"comfyui": COMFYUI_PIN, "custom_nodes": self._custom_nodes(),
-                    "idle_seconds": settings["idle_minutes"] * 60}
+                    "idle_seconds": settings["idle_minutes"] * 60,
+                    "model_cache_dir": "/content/drive/MyDrive/VEIL/model-cache" if settings["model_cache"] else None}
             booted = self.cli.exec_code(name, f"import json\nMEDIASTUDIO_WORKER.boot(json.loads({json.dumps(json.dumps(spec))}))", timeout=120)
             if booted.returncode != 0:
                 raise ColabCLIError(f"The worker did not boot: {booted.stderr.strip()[-300:]}", code="worker_failed")
         except ColabCLIError as exc:
+            if self.boot_stage == "drive":
+                self.drive_cache_state = "error"
             self._fail_runtime(str(exc), exc.code)
             self._stop_quietly(name)
             self._forget_owner(name)
@@ -611,7 +702,9 @@ class ColabRuntime:
             host = (urllib.parse.urlparse(url).hostname or "").casefold()
             if item["filename"] not in self.vm_files and (host == "civitai.com" or host.endswith(".civitai.com")):
                 url = signed_civitai_url(url, token)
-            resolved.append({**item, "url": url})
+            key = hashlib.sha256((item["folder"] + "/" + item["filename"] + "\n" + item["url"]
+                                  + "\n" + (item.get("sha256") or "")).encode()).hexdigest()
+            resolved.append({**item, "url": url, "cache_key": key})
         return resolved
 
     def _flush_markers(self) -> None:
@@ -733,6 +826,8 @@ class ColabRuntime:
             elif kind == "ready":
                 self.state, self.boot_stage, self.ready_at = "ready", "ready", time.time()
                 self.gpu_name = event.get("gpu")
+                if event.get("model_cache") is not None:
+                    self.drive_cache_state = "ready" if event["model_cache"] else "off"
             elif kind == "boot_failed":
                 self._fail_runtime(f"ComfyUI could not start on Colab: {event.get('message')}", "boot_failed")
             elif kind == "idle_stop":
@@ -750,6 +845,8 @@ class ColabRuntime:
                 }
                 if event.get("state") == "done":
                     self.vm_files.add(str(event.get("file")))
+            elif kind == "model_cache":
+                self.drive_cache_state = str(event.get("state") or "ready")
             elif kind == "job_queued":
                 job.state = "queued" if job.state in {"sent", "received", "preparing"} else job.state
             elif kind == "comfy":

@@ -210,7 +210,7 @@ class ColabCLI:
     def command(*args: str) -> str:
         quoted = " ".join(shlex.quote(str(arg)) for arg in args)
         migrate = f"if [ -d {LEGACY_SESSION_DIR} ] && [ ! -e {SESSION_DIR} ]; then mv {LEGACY_SESSION_DIR} {SESSION_DIR}; fi"
-        return f"{migrate}; mkdir -p {SESSION_DIR} && colab --auth oauth2 --config {SESSION_CONFIG} {quoted}"
+        return f"{migrate}; mkdir -p {SESSION_DIR} && exec colab --auth oauth2 --config {SESSION_CONFIG} {quoted}"
 
     def _call(self, *args: str, timeout: float = 60.0, input_text: str | None = None) -> subprocess.CompletedProcess[str]:
         try:
@@ -292,6 +292,13 @@ class ColabCLI:
         result = self._call("upload", "-s", name, self._map_path(local), remote, timeout=600.0)
         if result.returncode != 0:
             raise ColabCLIError(f"Upload to Colab failed: {_tail(result)}", code="upload_failed")
+
+    def start_drive_mount(self, name: str) -> subprocess.Popen[bytes]:
+        """Mount Drive while keeping stdin available for Google's access confirmation."""
+        try:
+            return self._start(self.command("drivemount", "-s", name, "/content/drive"), env=CLI_ENV)
+        except wsl.WslError as exc:
+            raise ColabCLIError("cannot start google drive connection", code="drive_mount_failed") from exc
 
     def download(self, name: str, remote: str, local: str | Path) -> None:
         Path(local).parent.mkdir(parents=True, exist_ok=True)

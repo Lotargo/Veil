@@ -969,7 +969,10 @@ Create can render on a Google Colab GPU under the user's own Google account (pla
 | `GET` | `/api/remote/colab/runtime` | VEIL's Colab runtime: state (`off`, `allocating`, `booting`, `ready`, `stopping`, `error`), GPU, boot stage, active jobs, images done and seconds until the idle auto-stop |
 | `POST` | `/api/remote/colab/runtime/start` | Allocate the runtime and boot the worker in the background (Create runs also start it on demand) |
 | `POST` | `/api/remote/colab/runtime/stop` | Release the runtime now; runs still waiting on it fail |
+| `POST` | `/api/remote/colab/drive/continue` | Resume a pending Drive mount after the user grants access in Google; 409 when no authorization is pending |
 | `GET/POST` | `/api/remote/settings` | Where Create runs (`local` or `colab`), the Colab GPU (`G4` default, `A100`, `L4`, `T4`, `H100`) and the idle auto-stop (2-60 minutes, default 10) |
+
+The remote settings `colab.model_cache` boolean defaults to `false` and enables persistent model weights in Google Drive for the next runtime. Runtime status includes `model_cache.enabled`, `model_cache.state` and a transient `model_cache.auth_url` when Google needs consent. Confirm access at the Google URL before POSTing `/api/remote/colab/drive/continue`. The cache path is `My Drive/VEIL/model-cache`; disabling the setting does not delete files or restart an existing runtime.
 
 ## Model sources
 

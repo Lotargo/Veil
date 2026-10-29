@@ -13,6 +13,7 @@ let installTimer = null;
 let newerVersion = null;
 let settingsTimer = null;
 let runtime = null; // MediaStudio's own Colab runtime
+let runtimeTimer = null;
 
 function $(id) {
     return document.getElementById(id);
@@ -107,12 +108,16 @@ async function loadStatus(refresh = false) {
 }
 
 async function loadRuntime() {
+    window.clearTimeout(runtimeTimer);
     try {
         runtime = await requestJson('/api/remote/colab/runtime');
     } catch {
         runtime = null;
     }
     render();
+    if (['allocating', 'booting'].includes(runtime?.state) && runtime.model_cache?.enabled) {
+        runtimeTimer = window.setTimeout(loadRuntime, 2000);
+    }
 }
 
 async function stopRuntime() {
@@ -449,6 +454,35 @@ function settingsCard() {
     });
     idle.append(label, range, el('p', 'cli-message', `From ${min} to ${max} minutes. The remote notebook also stops itself shortly after that if MediaStudio is closed or the computer sleeps.`));
     node.append(idle);
+    const cacheOption = el('label', 'remote-gpu-option');
+    const cacheToggle = el('input');
+    cacheToggle.type = 'checkbox';
+    cacheToggle.checked = Boolean(settings.colab.model_cache);
+    cacheToggle.addEventListener('change', () => saveSettings({ model_cache: cacheToggle.checked }));
+    cacheOption.append(cacheToggle, el('span', 'remote-gpu-text', 'Keep model weights in Google Drive'));
+    node.append(cacheOption, el('p', 'cli-message',
+        'Takes effect in the next Colab runtime. Models are saved in My Drive / VEIL / model-cache and copied to the fast runtime disk for generation. Google may ask you to grant Drive access.'));
+    const cache = runtime?.model_cache;
+    const states = {mounting: 'Connecting Google Drive…', authorizing: 'Google Drive needs your approval.',
+        ready: 'Google Drive model cache is ready.', saving: 'Saving model weights to Google Drive…',
+        saved: 'Model weights saved in Google Drive.', restoring: 'Loading cached weights from Google Drive…',
+        restored: 'Cached model weights loaded.', warning: 'The model cache reported an error; generation can still use the runtime copy.',
+        error: 'Google Drive could not connect. Grant access and try again.'};
+    if (cache?.enabled && states[cache.state]) node.append(el('p', 'cli-message', states[cache.state]));
+    if (cache?.auth_url) {
+        const link = el('a', 'btn btn-primary', 'Grant Google Drive access');
+        link.href = cache.auth_url;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        const resume = button('I have granted access', async () => {
+            try {
+                runtime = await postJson('/api/remote/colab/drive/continue');
+                render();
+                loadRuntime();
+            } catch (error) { toast(error.message, true); }
+        });
+        node.append(actions(link, resume));
+    }
     return node;
 }
 
@@ -468,7 +502,9 @@ function render() {
 }
 
 function onPane() {
-    if (window.location.hash.replace('#', '') === PANE && !status && !loading) loadStatus();
+    if (window.location.hash.replace('#', '') !== PANE || loading) return;
+    if (!status) loadStatus();
+    else loadRuntime();
 }
 
 render();

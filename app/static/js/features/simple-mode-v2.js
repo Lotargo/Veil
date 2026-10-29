@@ -3158,6 +3158,7 @@ function runtimeUp(status) {
 
 const COLAB_BOOT_STAGES = {
     allocating: 'getting a GPU',
+    drive: 'connecting Google Drive',
     comfyui: 'getting ComfyUI',
     requirements: 'installing packages',
     nodes: 'installing the photo-edit nodes',
@@ -3216,6 +3217,8 @@ function downloadsText(remote) {
 /** What a Colab run is doing once the runtime is up, before ComfyUI reports its own progress. */
 function remoteStageText(remote) {
     if (!remote || remoteLaunching(remote)) return '';
+    if (remote.model_cache?.state === 'restoring') return 'Copying model weights from Google Drive';
+    if (remote.model_cache?.state === 'saving') return 'Saving model weights to Google Drive';
     if (['waiting', 'sent', 'received', 'preparing'].includes(remote.job_state)) return 'Sending to Colab';
     if (remote.job_state === 'collecting') return 'Fetching the image from Colab';
     return '';
@@ -3226,6 +3229,10 @@ function remoteStageText(remote) {
 const LAUNCH_READY_MS = 2600;
 
 function launchWaitText(kind) {
+    const cache = currentRemote(state.job)?.model_cache || state.colab?.model_cache;
+    if (kind === 'colab' && cache?.state === 'authorizing') {
+        return 'Google Drive needs access. Open the Google access page in the dialog.';
+    }
     return kind === 'colab' ? 'Starts once the Colab GPU is ready' : 'Starts once ComfyUI is running';
 }
 
@@ -3249,6 +3256,9 @@ function launchStatus() {
         const phase = remote?.runtime_state || runtime.state;
         if (phase === 'allocating') return { kind: 'colab', title: `Starting Colab ${gpu}`, stage: 'Getting a GPU', since: runtime.started_at };
         if (phase === 'booting') {
+            if ((remote?.model_cache || runtime.model_cache)?.state === 'authorizing') {
+                return { kind: 'colab', title: 'Google Drive needs access', stage: 'Open the Google access page in the dialog', since: runtime.started_at };
+            }
             const stage = sentenceCase(COLAB_BOOT_STAGES[remote?.boot_stage || runtime.boot_stage] || 'setting up');
             return { kind: 'colab', title: `Starting Colab ${gpu}`, stage, since: runtime.started_at };
         }
@@ -3279,8 +3289,62 @@ function launchSucceeded(kind) {
     return state.job?.runtimeProgress?.state === 'ready' || state.job?.phase === 'running' || runtimeUp(state.runtimeStatus);
 }
 
+function paintDriveAccess() {
+    const dialog = $('drive-access');
+    if (!dialog) return;
+    const cache = state.colab?.model_cache;
+    if (state.backend === 'colab' && currentRemote(state.job)?.model_cache?.state === 'authorizing'
+        && !cache?.auth_url && !state.driveAccessLoading) {
+        state.driveAccessLoading = true;
+        loadColabRuntime().finally(() => { state.driveAccessLoading = false; });
+    }
+    let url = null;
+    try {
+        const candidate = new URL(cache?.auth_url);
+        if (candidate.protocol === 'https:' && ['accounts.google.com', 'colab.research.google.com'].includes(candidate.hostname)) url = candidate.href;
+    } catch { /* No authorization link until Google requests consent. */ }
+    const waiting = state.backend === 'colab' && state.colab?.state === 'booting' && Boolean(url);
+    const opening = waiting && dialog.hidden;
+    dialog.hidden = !waiting;
+    $('drive-access-backdrop').hidden = !waiting;
+    if (!waiting) return;
+    const open = $('drive-access-open');
+    open.href = url;
+    if (opening) {
+        $('drive-access-message').textContent = 'Only confirm after Google says access has been granted.';
+        open.focus();
+    }
+    $('drive-access-copy').onclick = async () => {
+        try {
+            await navigator.clipboard.writeText(url);
+            $('drive-access-message').textContent = 'Link copied. Paste it into your browser and allow access in Google.';
+        } catch {
+            $('drive-access-message').textContent = 'Could not copy the link. Use the Google access button above.';
+        }
+    };
+    $('drive-access-confirm').onclick = async () => {
+        const button = $('drive-access-confirm');
+        button.disabled = true;
+        try {
+            state.colab = await json('/api/remote/colab/drive/continue', { method: 'POST' });
+            paintDriveAccess();
+            loadColabRuntime();
+        } catch (err) {
+            $('drive-access-message').textContent = err.message;
+        } finally { button.disabled = false; }
+    };
+    $('drive-access-cancel').onclick = async () => {
+        try {
+            state.colab = await json('/api/remote/colab/runtime/stop', { method: 'POST' });
+            paintDriveAccess();
+            loadColabRuntime();
+        } catch (err) { $('drive-access-message').textContent = err.message; }
+    };
+}
+
 /** The small notice while ComfyUI or a Colab GPU starts, then a short "ready". */
 function paintLaunch() {
+    paintDriveAccess();
     const toast = $('launch-toast');
     if (!toast) return;
     const status = launchStatus();

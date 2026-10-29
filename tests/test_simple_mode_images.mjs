@@ -46,6 +46,7 @@ function harness(available = [], delayed = []) {
                 : selector === '.ambient-container.has-ambient' ? (ambient.classList.contains('has-ambient') ? ambient : null)
                     : selector === '.canvas-artwork-wrap' ? artwork : null,
         },
+        URL,
         Image: class {
             set src(url) {
                 requests.push(url);
@@ -272,4 +273,36 @@ test('changing the interval cancels an earlier automatic switch and disabling st
     h.run('setAmbientInterval(0)');
     assert.equal(h.timers.size, 0);
     assert.equal(h.context.localStorage.getItem('mediastudio_simple_ambient_interval'), '0');
+});
+
+
+test('Create displays Google access in place and hides stale consent links', () => {
+    const h = harness();
+    for (const id of ['drive-access', 'drive-access-backdrop', 'drive-access-open', 'drive-access-copy',
+        'drive-access-message', 'drive-access-confirm', 'drive-access-cancel']) {
+        h.elements.set(id, {hidden: true, focus() { this.focused = true; }});
+    }
+    h.run(`state.backend = 'colab'; state.colab = {state: 'booting', model_cache: {
+        state: 'authorizing', auth_url: 'https://accounts.google.com/test-consent'}}; paintDriveAccess();`);
+    assert.equal(h.elements.get('drive-access').hidden, false);
+    assert.equal(h.elements.get('drive-access-open').href, 'https://accounts.google.com/test-consent');
+    assert.equal(h.elements.get('drive-access-open').focused, true);
+    assert.equal(typeof h.elements.get('drive-access-copy').onclick, 'function');
+    h.run(`state.colab.state = 'error'; paintDriveAccess();`);
+    assert.equal(h.elements.get('drive-access').hidden, true);
+    assert.equal(h.elements.get('drive-access-backdrop').hidden, true);
+});
+
+
+test('a queued Drive consent request refreshes the initially idle runtime', async () => {
+    const h = harness();
+    h.elements.set('drive-access', {hidden: true});
+    h.elements.set('drive-access-backdrop', {hidden: true});
+    h.run(`state.backend = 'colab'; state.colab = {state: 'off'};
+        currentRemote = () => ({model_cache: {state: 'authorizing'}});
+        state.driveRefreshes = 0;
+        loadColabRuntime = async () => { state.driveRefreshes += 1; };
+        paintDriveAccess(); paintDriveAccess();`);
+    assert.equal(h.run('state.driveRefreshes'), 1);
+    await Promise.resolve();
 });

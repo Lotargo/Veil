@@ -54,6 +54,7 @@ def _remote_settings(raw: Any) -> dict[str, Any]:
         "colab": {
             "gpu": gpu if gpu in COLAB_GPUS else DEFAULT_COLAB_GPU,
             "idle_minutes": min(IDLE_MINUTES_MAX, max(IDLE_MINUTES_MIN, idle)),
+            "model_cache": colab.get("model_cache") is True,
         },
     }
 
@@ -479,6 +480,7 @@ class ConfigStore:
         backend: str | None = None,
         colab_gpu: str | None = None,
         colab_idle_minutes: int | None = None,
+        colab_model_cache: bool | None = None,
     ) -> dict[str, Any]:
         """Change remote GPU settings; values outside the allowed ones raise ValueError."""
         if backend is not None and backend not in REMOTE_BACKENDS:
@@ -487,6 +489,8 @@ class ConfigStore:
             raise ValueError(f"Unknown Colab GPU: {colab_gpu}")
         if colab_idle_minutes is not None and not IDLE_MINUTES_MIN <= int(colab_idle_minutes) <= IDLE_MINUTES_MAX:
             raise ValueError(f"Idle minutes must be {IDLE_MINUTES_MIN}-{IDLE_MINUTES_MAX}.")
+        if colab_model_cache is not None and not isinstance(colab_model_cache, bool):
+            raise ValueError("model cache must be a boolean")
         with _config_lock:
             config = self.load()
             remote = _remote_settings(config.get("remote"))
@@ -496,6 +500,8 @@ class ConfigStore:
                 remote["colab"]["gpu"] = colab_gpu.upper()
             if colab_idle_minutes is not None:
                 remote["colab"]["idle_minutes"] = int(colab_idle_minutes)
+            if colab_model_cache is not None:
+                remote["colab"]["model_cache"] = colab_model_cache
             config["remote"] = remote
             self.save(config)
             return remote

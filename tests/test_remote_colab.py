@@ -183,9 +183,9 @@ def test_wsl_passes_the_script_through_the_environment():
 
 def test_remote_settings_are_normalized_and_validated(tmp_path):
     store = ConfigStore(tmp_path / "config.json")
-    assert store.remote_settings() == {"backend": "local", "colab": {"gpu": "G4", "idle_minutes": 10}}
+    assert store.remote_settings() == {"backend": "local", "colab": {"gpu": "G4", "idle_minutes": 10, "model_cache": False}}
     store.update_remote_settings(backend="colab", colab_gpu="l4", colab_idle_minutes=2)
-    assert store.remote_settings() == {"backend": "colab", "colab": {"gpu": "L4", "idle_minutes": 2}}
+    assert store.remote_settings() == {"backend": "colab", "colab": {"gpu": "L4", "idle_minutes": 2, "model_cache": False}}
     for kwargs in ({"colab_idle_minutes": 1}, {"colab_idle_minutes": 61}, {"colab_gpu": "V100"}, {"backend": "cloud"}):
         with pytest.raises(ValueError):
             store.update_remote_settings(**kwargs)
@@ -206,7 +206,7 @@ def remote_client(tmp_path, monkeypatch):
 def test_settings_route_validates_idle_minutes(remote_client):
     assert remote_client.post("/api/remote/settings", json={"colab": {"idle_minutes": 90}}).status_code == 400
     data = remote_client.post("/api/remote/settings", json={"colab": {"gpu": "A100", "idle_minutes": 25}}).get_json()
-    assert data["colab"] == {"gpu": "A100", "idle_minutes": 25}
+    assert data["colab"] == {"gpu": "A100", "idle_minutes": 25, "model_cache": False}
     assert data["idle_minutes_range"] == [2, 60]
     assert data["gpus"][0]["id"] == "G4"
 
@@ -271,3 +271,17 @@ def test_exec_retries_a_stalled_connection_but_not_a_failing_snippet(monkeypatch
     cli, runner = _cli({" exec ": [(1, "", "NameError: name 'x' is not defined"), (0, "", "")]})
     assert cli.exec_code("mediastudio", "x").returncode == 1
     assert len(runner.scripts) == 1
+
+
+def test_model_cache_setting_is_persisted_and_requires_boolean(remote_client):
+    response = remote_client.post("/api/remote/settings", json={"colab": {"model_cache": True}})
+    assert response.status_code == 200
+    assert remote_client.get("/api/remote/settings").get_json()["colab"]["model_cache"] is True
+    assert remote_client.post("/api/remote/settings", json={"colab": {"model_cache": "false"}}).status_code == 400
+
+
+
+def test_drive_confirmation_requires_pending_runtime(remote_client, monkeypatch):
+    from app.remote import colab_backend
+    monkeypatch.setattr(colab_backend, "existing_runtime", lambda: None)
+    assert remote_client.post("/api/remote/colab/drive/continue").status_code == 409

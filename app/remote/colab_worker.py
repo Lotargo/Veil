@@ -52,7 +52,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-WORKER_VERSION = "1"
+WORKER_VERSION = "2"
 EVENT_PREFIX = "@@mediastudio "
 ATTACH_END_PREFIX = "@@mediastudio-end "
 ROOT = Path("/content/mediastudio")
@@ -133,11 +133,14 @@ def parse_job(text: str) -> dict[str, Any]:
         sha = str(item.get("sha256") or "").lower() or None
         if sha and not _SHA256.match(sha):
             raise WorkerError(f"Bad sha256 for {item.get('filename')!r}")
+        if item.get("cache_key") and not _SHA256.fullmatch(str(item["cache_key"])):
+            raise WorkerError("invalid model cache key")
         resources.append({
             "folder": safe_name(item.get("folder"), label="model folder"),
             "filename": safe_name(item.get("filename"), label="model file"),
             "url": url,
             "sha256": sha,
+            **({"cache_key": str(item["cache_key"])} if item.get("cache_key") else {}),
         })
     extra = raw.get("extra_data")
     return {
@@ -323,6 +326,8 @@ class Worker:
 
     def __init__(self, *, root: Path = ROOT, comfy_dir: Path = COMFY_DIR, port: int = DEFAULT_PORT):
         self.root, self.comfy_dir, self.port = Path(root), Path(comfy_dir), int(port)
+        self.model_cache_dir: Path | None = None
+        self._cached_models: set[str] = set()
         self.inbox, self.inputs, self.outbox = self.root / "inbox", self.root / "inbox" / "inputs", self.root / "outbox"
         for folder in (self.inbox, self.inputs, self.outbox):
             folder.mkdir(parents=True, exist_ok=True)
@@ -346,6 +351,12 @@ class Worker:
 
     def boot(self, spec: dict[str, Any]) -> None:
         """Start the worker threads once; a second call only reports the current state."""
+        cache = spec.get("model_cache_dir")
+        if cache:
+            drive = Path("/content/drive/MyDrive")
+            if not drive.is_dir():
+                raise WorkerError("google drive is not mounted for the model cache")
+            self.model_cache_dir = drive / "VEIL" / "model-cache"
         self.set_idle(spec.get("idle_seconds", self.idle_seconds))
         with self._lock:
             if self._started:
@@ -447,7 +458,7 @@ class Worker:
         self.ready.set()
         self.touch()
         self.log.emit("ready", seconds=round(time.time() - started, 1), gpu=self._gpu_name(),
-                      comfyui=spec.get("comfyui", {}).get("commit"))
+                      comfyui=spec.get("comfyui", {}).get("commit"), model_cache=bool(self.model_cache_dir))
         threading.Thread(target=self._comfy_events, daemon=True, name="mediastudio-comfy-ws").start()
 
     def _prepare_comfyui(self, spec: dict[str, Any]) -> None:
@@ -657,8 +668,11 @@ class Worker:
         target = self.comfy_dir / "models" / resource["folder"] / resource["filename"]
         with self._file_lock(str(target)):
             if target.is_file():
+                self._cache_model(resource, target, job_id)
                 return
             target.parent.mkdir(parents=True, exist_ok=True)
+            if self._restore_model(resource, target, job_id):
+                return
             started = time.time()
             self.log.emit("download", job=job_id, file=resource["filename"], state="started")
             hf = hf_parts(resource["url"])
@@ -672,6 +686,97 @@ class Worker:
             seconds = max(0.01, time.time() - started)
             self.log.emit("download", job=job_id, file=resource["filename"], state="done", bytes=size,
                           seconds=round(seconds, 1), mb_per_s=round(size / 1e6 / seconds))
+            self._cache_model(resource, target, job_id)
+
+    def _cache_paths(self, resource: dict[str, Any]) -> tuple[Path, Path] | None:
+        if self.model_cache_dir is None:
+            return None
+        key = resource.get("cache_key") or resource.get("sha256")
+        if not key:
+            key = hashlib.sha256(resource["url"].encode()).hexdigest()
+        folder = self.model_cache_dir / resource["folder"] / key
+        target = folder / resource["filename"]
+        return target, folder / "integrity.json"
+
+    def _copy_model(self, source: Path, target: Path, expected: str | None) -> str:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        partial = target.with_name(target.name + f".{uuid.uuid4().hex}.part")
+        digest = hashlib.sha256()
+        try:
+            with source.open("rb") as reader, partial.open("xb") as writer:
+                while chunk := reader.read(DOWNLOAD_CHUNK):
+                    if self._stop.is_set():
+                        raise WorkerError("model cache copy cancelled")
+                    writer.write(chunk)
+                    digest.update(chunk)
+                    self.touch()
+                writer.flush()
+                os.fsync(writer.fileno())
+            actual = digest.hexdigest()
+            if expected and actual != expected:
+                raise WorkerError("model cache checksum mismatch")
+            if partial.stat().st_size == 0:
+                raise WorkerError("model cache file is empty")
+            os.replace(partial, target)
+            return actual
+        finally:
+            partial.unlink(missing_ok=True)
+
+    def _restore_model(self, resource: dict[str, Any], target: Path, job_id: str) -> bool:
+        paths = self._cache_paths(resource)
+        if paths is None:
+            return False
+        source, manifest = paths
+        if not manifest.is_file() or not source.is_file():
+            return False
+        try:
+            integrity = json.loads(manifest.read_text(encoding="utf-8"))
+            checksum = integrity["sha256"]
+            if not isinstance(checksum, str) or not _SHA256.fullmatch(checksum):
+                raise WorkerError("invalid model cache checksum")
+            if resource.get("sha256") and resource["sha256"] != checksum:
+                raise WorkerError("model cache version mismatch")
+            if source.stat().st_size != integrity["bytes"]:
+                raise WorkerError("model cache size mismatch")
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="restoring")
+            self._copy_model(source, target, checksum)
+            self._cached_models.add(str(source))
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="restored")
+            return True
+        except (OSError, ValueError, KeyError, TypeError, WorkerError) as exc:
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="warning", message=str(exc))
+            return False
+
+    def _cache_model(self, resource: dict[str, Any], source: Path, job_id: str) -> None:
+        paths = self._cache_paths(resource)
+        if paths is None:
+            return
+        target, manifest = paths
+        if str(target) in self._cached_models:
+            return
+        try:
+            if target.is_file() and manifest.is_file():
+                try:
+                    integrity = json.loads(manifest.read_text(encoding="utf-8"))
+                except (ValueError, OSError):
+                    integrity = {}
+                if (isinstance(integrity, dict) and integrity.get("bytes") == target.stat().st_size == source.stat().st_size
+                        and _sha256_file(target) == integrity.get("sha256")
+                        and (not resource.get("sha256") or integrity.get("sha256") == resource["sha256"])):
+                    self._cached_models.add(str(target))
+                    return
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="saving")
+            checksum = self._copy_model(source, target, resource.get("sha256"))
+            temporary = manifest.with_name(f"integrity.{uuid.uuid4().hex}.part")
+            try:
+                temporary.write_text(json.dumps({"sha256": checksum, "bytes": target.stat().st_size}), encoding="utf-8")
+                os.replace(temporary, manifest)
+            finally:
+                temporary.unlink(missing_ok=True)
+            self._cached_models.add(str(target))
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="saved")
+        except (OSError, ValueError, TypeError, WorkerError) as exc:
+            self.log.emit("model_cache", job=job_id, file=resource["filename"], state="warning", message=str(exc))
 
     def _hf_download(self, parts: tuple[str, str, str], target: Path) -> bool:
         try:

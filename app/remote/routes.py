@@ -355,6 +355,22 @@ def colab_runtime_stop():
     return jsonify({**_runtime_payload(_config_store()), "state": "stopping" if runtime else "off"})
 
 
+@remote_blueprint.route("/api/remote/colab/drive/continue", methods=["POST"])
+def colab_drive_continue():
+    from .colab_backend import existing_runtime
+
+    if (denied := _local_only()) is not None:
+        return denied
+    runtime = existing_runtime()
+    try:
+        if runtime is None:
+            raise ColabCLIError("no colab runtime is waiting for drive access", code="drive_not_waiting")
+        runtime.continue_drive_auth()
+    except ColabCLIError as exc:
+        return _error(exc, 409)
+    return jsonify(_runtime_payload(_config_store()))
+
+
 @remote_blueprint.route("/api/remote/settings", methods=["GET", "POST"])
 def remote_settings():
     store = _config_store()
@@ -366,6 +382,7 @@ def remote_settings():
                 backend=payload.get("backend"),
                 colab_gpu=colab.get("gpu"),
                 colab_idle_minutes=int(colab["idle_minutes"]) if colab.get("idle_minutes") is not None else None,
+                colab_model_cache=colab.get("model_cache"),
             )
         except (TypeError, ValueError) as exc:
             return jsonify({"error": str(exc), "code": "settings_invalid"}), 400

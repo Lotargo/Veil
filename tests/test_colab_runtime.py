@@ -6,6 +6,7 @@ import os
 import queue
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 
@@ -120,6 +121,64 @@ def _wait(condition, timeout=15.0, label="condition"):
             return
         time.sleep(0.05)
     raise AssertionError(f"timed out waiting for {label}")
+
+
+def test_drive_mount_waits_for_explicit_confirmation(tmp_path, runtimes):
+    cli = _FakeCLI()
+    process = subprocess.Popen([sys.executable, "-u", "-c",
+        "print('[colab] REQUIRED: Google Drive Authorization needed.'); "
+        "print('https://accounts.google.com/test-consent'); input()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cli.start_drive_mount = lambda name: process
+    runtime = runtimes(ConfigStore(tmp_path / "config.json"), tmp_path / "cache", cli)
+    runtime.state = "booting"
+    errors = []
+    def mount():
+        try:
+            runtime._mount_drive("test")
+        except Exception as exc:
+            errors.append(exc)
+    thread = threading.Thread(target=mount)
+    thread.start()
+    try:
+        _wait(lambda: runtime.drive_auth_url is not None, timeout=3)
+        assert process.poll() is None
+        assert runtime.status()["model_cache"]["auth_url"] == "https://accounts.google.com/test-consent"
+        runtime.continue_drive_auth()
+        thread.join(timeout=3)
+        assert not thread.is_alive()
+        assert not errors
+        assert runtime.drive_cache_state == "ready"
+        assert runtime.drive_auth_url is None
+        assert runtime._drive_process is None
+    finally:
+        if process.poll() is None:
+            process.kill()
+        thread.join(timeout=3)
+
+
+def test_stopping_drive_mount_terminates_pending_process(tmp_path, runtimes):
+    cli = _FakeCLI()
+    process = subprocess.Popen([sys.executable, "-u", "-c", "input()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cli.start_drive_mount = lambda name: process
+    runtime = runtimes(ConfigStore(tmp_path / "config.json"), tmp_path / "cache", cli)
+    runtime.state = "off"
+    with pytest.raises(colab_runtime.ColabCLIError, match="cancelled"):
+        runtime._mount_drive("test")
+    assert process.poll() is not None
+    assert runtime._drive_process is None
+
+
+def test_cache_identity_does_not_use_temporary_signed_url(tmp_path, monkeypatch, runtimes):
+    runtime = runtimes(ConfigStore(tmp_path / "config.json"), tmp_path / "cache", _FakeCLI())
+    item = {"folder": "loras", "filename": "model.safetensors", "url": "https://civitai.com/api/download/models/1"}
+    monkeypatch.setattr(colab_runtime, "signed_civitai_url", lambda *args: "https://cdn.example.com/a?signature=one")
+    first = runtime._resolved([item])[0]
+    monkeypatch.setattr(colab_runtime, "signed_civitai_url", lambda *args: "https://cdn.example.com/a?signature=two")
+    second = runtime._resolved([item])[0]
+    assert first["cache_key"] == second["cache_key"]
+    assert first["url"] != second["url"]
 
 
 @pytest.fixture
@@ -464,3 +523,18 @@ def test_signed_civitai_url_keeps_the_token_local():
     assert excinfo.value.code == "civitai_token_required"
     with pytest.raises(ColabCLIError):
         signed_civitai_url(url, "tok", opener=_Opener(307, "https://b2.civitai.com/x?token=tok"))
+
+
+def test_drive_timeout_is_not_reported_as_user_cancellation(tmp_path, monkeypatch, runtimes):
+    cli = _FakeCLI()
+    process = subprocess.Popen([sys.executable, "-u", "-c", "input()"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    cli.start_drive_mount = lambda name: process
+    runtime = runtimes(ConfigStore(tmp_path / "config.json"), tmp_path / "cache", cli)
+    runtime.state = "booting"
+    monkeypatch.setattr(colab_runtime, "DRIVE_AUTH_TIMEOUT_SECONDS", 0)
+    with pytest.raises(ColabCLIError) as caught:
+        runtime._mount_drive("test")
+    assert caught.value.code == "drive_auth_timeout"
+    assert "cancelled" not in str(caught.value)
+    assert process.poll() is not None

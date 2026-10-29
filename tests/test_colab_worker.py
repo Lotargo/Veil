@@ -19,6 +19,77 @@ EARLY = "11111111-2222-4333-8444-555555555555"
 LATE = "66666666-7777-4888-9999-aaaaaaaaaaaa"
 
 
+def _cached_worker(tmp_path, monkeypatch):
+    worker = cw.Worker(root=tmp_path / "worker", comfy_dir=tmp_path / "ComfyUI")
+    worker.model_cache_dir = tmp_path / "drive"
+    content = b"complete model weights"
+    resource = {"folder": "loras", "filename": "model.safetensors",
+                "url": "https://example.com/model", "sha256": hashlib.sha256(content).hexdigest()}
+    calls = []
+    def download(resource, target, job_id):
+        calls.append(resource["url"])
+        target.write_bytes(content)
+    monkeypatch.setattr(worker, "_http_download", download)
+    target = worker.comfy_dir / "models/loras/model.safetensors"
+    return worker, resource, target, content, calls
+
+
+def test_download_is_cached_and_restored_without_network(tmp_path, monkeypatch):
+    worker, resource, target, content, calls = _cached_worker(tmp_path, monkeypatch)
+    worker._ensure_resource(resource, JOB)
+    target.unlink()
+    worker._cached_models.clear()
+    worker._ensure_resource(resource, JOB)
+    assert calls == [resource["url"]]
+    assert target.read_bytes() == content
+    assert any(event["ev"] == "model_cache" and event["state"] == "restored" for event in worker.log.after(0))
+
+
+@pytest.mark.parametrize("corruption", ["weights", "manifest", "missing_manifest"])
+def test_corrupt_cache_is_downloaded_and_repaired(tmp_path, monkeypatch, corruption):
+    worker, resource, target, content, calls = _cached_worker(tmp_path, monkeypatch)
+    worker._ensure_resource(resource, JOB)
+    cached, manifest = worker._cache_paths(resource)
+    if corruption == "weights":
+        cached.write_bytes(b"x" * len(content))
+    elif corruption == "manifest":
+        manifest.write_text("{broken")
+    else:
+        manifest.unlink()
+    target.unlink()
+    worker._cached_models.clear()
+    worker._ensure_resource(resource, JOB)
+    assert len(calls) == 2
+    assert cached.read_bytes() == target.read_bytes() == content
+    assert json.loads(manifest.read_text())["sha256"] == resource["sha256"]
+
+
+def test_cache_write_failure_preserves_downloaded_model(tmp_path, monkeypatch):
+    worker, resource, target, content, calls = _cached_worker(tmp_path, monkeypatch)
+    worker.model_cache_dir.write_text("not a directory")
+    worker._ensure_resource(resource, JOB)
+    assert target.read_bytes() == content
+    assert len(calls) == 1
+    assert any(event["ev"] == "model_cache" and event["state"] == "warning" for event in worker.log.after(0))
+
+
+def test_cache_cancel_does_not_publish_partial_file(tmp_path, monkeypatch):
+    worker, _, target, content, _ = _cached_worker(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    source.write_bytes(content)
+    worker._stop.set()
+    with pytest.raises(cw.WorkerError, match="cancelled"):
+        worker._copy_model(source, target, None)
+    assert not target.exists()
+    assert not list(target.parent.glob("*.part"))
+
+
+def test_model_cache_key_cannot_escape_cache_directory():
+    with pytest.raises(cw.WorkerError, match="cache key"):
+        cw.parse_job(_job(resources=[{"folder": "loras", "filename": "model", "url": "https://example.com/m",
+                                     "cache_key": "../outside"}]))
+
+
 def _job(**overrides):
     job = {
         "id": JOB,
